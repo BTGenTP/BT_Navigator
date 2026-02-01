@@ -33,6 +33,8 @@ from xml.etree.ElementTree import Comment, Element, ElementTree, SubElement
 
 import datetime
 
+from prompt_guardrails import SafetyReport, analyze_prompt_heuristic, call_moderation_llm
+
 try:  # Support d'un fichier .env facultatif
     from dotenv import load_dotenv  # type: ignore
 except ImportError:  # pragma: no cover
@@ -44,6 +46,8 @@ if load_dotenv is not None:
 
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "mistral-large-latest")
 DEFAULT_API_BASE = os.getenv("LLM_API_BASE", "https://api.mistral.ai/v1")
+DEFAULT_MODERATION_MODEL = os.getenv("LLM_MODERATION_MODEL", "mistral-large-latest")
+DEFAULT_MODERATION_API_BASE = os.getenv("LLM_MODERATION_API_BASE", "https://api.mistral.ai/v1")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent  # nav4rails/ (assumption based on layout)
@@ -68,6 +72,108 @@ class MissionStep:
     skill: str
     params: Dict[str, Any]
     comment: Optional[str] = None
+
+
+def _is_interactive_stdin() -> bool:
+    try:
+        return bool(sys.stdin.isatty())
+    except Exception:
+        return False
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError as exc:
+        raise RuntimeError(
+            "Entrée utilisateur indisponible (EOF). "
+            "Utilisez --mode fail-fast ou --mode auto-rewrite pour exécuter sans interaction."
+        ) from exc
+
+
+def _normalize_prompt(text: str) -> str:
+    # Normalisation minimale: whitespace + trim
+    out = " ".join((text or "").strip().split())
+    return out
+
+
+def _auto_rewrite_prompt(text: str, *, allowed_skills: List[str], max_chars: int) -> str:
+    """
+    Réécriture heuristique: réduire le bruit et forcer une formulation "mission → étapes".
+    """
+    raw = (text or "").strip()
+    # Supprime blocs multi-lignes "bruit" (logs) par heuristique simple
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    kept: List[str] = []
+    for ln in lines:
+        if len(ln) > 240:
+            continue
+        if ln.lower().startswith(("traceback", "error:", "warning:", "debug:", "info:")):
+            continue
+        kept.append(ln)
+        if len(kept) >= 30:
+            break
+    compact = " ".join(kept) if kept else _normalize_prompt(raw)
+
+    hint = (
+        "Mission TurtleBot (décris uniquement des actions concrètes). "
+        "Contraintes: renvoyer une liste d'étapes parmi les skills autorisés. "
+        f"Skills autorisés: {', '.join(allowed_skills)}. "
+        "Unités: Wait=secondes, Spin=radians, BackUp=meters+m/s, DriveOnHeading=meters+m/s+seconds. "
+        "Réponds sans contexte inutile."
+    )
+    rewritten = f"{hint}\nMission: {compact}"
+    rewritten = rewritten.strip()
+    if len(rewritten) > max_chars:
+        rewritten = rewritten[: max(0, max_chars - 3)].rstrip() + "..."
+    return rewritten
+
+
+def _extract_missing_port(err: Exception) -> Optional[Dict[str, str]]:
+    """
+    Tente d'extraire {skill, port} depuis les messages d'erreur de _parse_steps().
+    """
+    msg = str(err)
+    # Exemple: "Étape 'Wait': port requis manquant: wait_duration"
+    import re
+
+    m = re.search(r"Étape\s+'([^']+)':\s*port requis manquant:\s*([A-Za-z0-9_]+)", msg)
+    if not m:
+        return None
+    return {"skill": m.group(1), "port": m.group(2)}
+
+
+def _apply_guardrails(
+    *,
+    text: str,
+    guardrails_mode: str,
+    moderation_api_key: Optional[str],
+    moderation_api_base: str,
+    moderation_model: str,
+) -> SafetyReport:
+    if guardrails_mode == "off":
+        return SafetyReport(ok=True, blocked=False, findings=[])
+
+    heur = analyze_prompt_heuristic(text)
+    if guardrails_mode == "heuristic":
+        return heur
+
+    # hybrid: heuristique + modération optionnelle
+    if heur.blocked:
+        return heur
+    if moderation_api_key and moderation_api_base and moderation_model:
+        mod = call_moderation_llm(
+            text=text,
+            api_key=moderation_api_key,
+            api_base=moderation_api_base,
+            model=moderation_model,
+        )
+        # fusion des findings
+        if mod.findings:
+            merged = list(heur.findings) + list(mod.findings)
+            blocked = bool(heur.blocked or mod.blocked)
+            return SafetyReport(ok=not blocked, blocked=blocked, findings=merged, redacted_text=heur.redacted_text)
+    return heur
 
 
 def _strip_markdown_fences(raw: str) -> str:
@@ -329,6 +435,58 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--api-base", type=str, default=DEFAULT_API_BASE)
     p.add_argument("--api-key", type=str, default=None)
     p.add_argument("--dry-run", action="store_true", help="Affiche le XML sur stdout.")
+    p.add_argument(
+        "--mode",
+        choices=["interactive", "fail-fast", "auto-rewrite"],
+        default="interactive",
+        help="Politique face aux prompts trop longs/ambigus: interactive (défaut), fail-fast, auto-rewrite.",
+    )
+    p.add_argument(
+        "--max-prompt-chars",
+        type=int,
+        default=2000,
+        help="Budget max (caractères) appliqué au prompt utilisateur avant appel LLM (défaut: 2000).",
+    )
+    p.add_argument(
+        "--max-clarify-rounds",
+        type=int,
+        default=3,
+        help="Nombre max d'itérations de clarification en mode interactive (défaut: 3).",
+    )
+    p.add_argument(
+        "--guardrails",
+        choices=["off", "heuristic", "hybrid"],
+        default="hybrid",
+        help="Guardrails: off, heuristic (regex/règles), hybrid (heuristic + modération optionnelle).",
+    )
+    p.add_argument("--moderation-api-key", type=str, default=None, help="Clé API modération (optionnel).")
+    p.add_argument(
+        "--moderation-api-base",
+        type=str,
+        default=DEFAULT_MODERATION_API_BASE,
+        help="Base URL OpenAI-compatible pour modération (optionnel).",
+    )
+    p.add_argument(
+        "--moderation-model",
+        type=str,
+        default=DEFAULT_MODERATION_MODEL,
+        help="Nom du modèle de modération (optionnel).",
+    )
+    p.add_argument(
+        "--validate-xml",
+        action="store_true",
+        help="Valide le BT XML généré via validate_bt_xml.py avant d'écrire le fichier.",
+    )
+    p.add_argument(
+        "--strict-validate-attrs",
+        action="store_true",
+        help="Avec --validate-xml: attributs inconnus = erreur.",
+    )
+    p.add_argument(
+        "--strict-validate-blackboard",
+        action="store_true",
+        help="Avec --validate-xml: blackboard incohérent = erreur.",
+    )
     return p.parse_args(argv)
 
 

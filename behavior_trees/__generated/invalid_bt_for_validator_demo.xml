@@ -1,0 +1,27 @@
+<!-- Intentionally invalid BT for validator demo -->
+<root>
+  <BehaviorTree ID="MainTree">
+    <Sequence name="InvalidDemo">
+      <!-- Missing required port wait_duration -->
+      <Wait />
+
+      <!-- References an undefined subtree -->
+      <SubTree ID="MissingSubtree" __shared_blackboard="true"/>
+
+      <!-- Unknown tag (not in allowlist) -->
+      <DefinitelyNotANav2Node foo="bar"/>
+
+      <!-- Repeat without num_cycles (warning) -->
+      <Repeat>
+        <Sequence/>
+      </Repeat>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- Duplicate ID (error) -->
+  <BehaviorTree ID="MainTree">
+    <Sequence/>
+  </BehaviorTree>
+</root>
+
+

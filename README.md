@@ -15,6 +15,8 @@ L’objectif est de recevoir une mission en langage naturel, de la convertir via
 - `script/`:
   - `bt_nodes_catalog.json`: **catalogue** des compétences/nœuds autorisés (ports + description)
   - `gen_turtlebot_mission_bt.py`: générateur **prompt → LLM → JSON → XML**
+  - `validate_bt_xml.py`: validateur statique **post-génération** (XML/structure/ports/blackboard)
+  <!-- - `scan_reference_bts.py`: scan des BT de référence pour dériver une allowlist (tags/attrs/blackboard) -->
   - `run_turtlebot3_nav2_generated_bt.sh`: pipeline Gazebo + Nav2 utilisant le BT généré
 
 ---
@@ -117,6 +119,9 @@ Ce script:
 - `--auto`: ignore la confirmation “Valider le BT ?”
 - `--no-rviz`: ne lance pas RViz
 - `--send-goal`: envoie automatiquement un goal Nav2 (déclenche l’exécution du BT)
+- `--validate-bt`: valide le BT XML avant simulation (par défaut: activé)
+- `--no-validate-bt`: désactive la validation statique avant simulation
+- `--strict-validate-attrs`: mode strict (attributs inconnus = erreur)
 - `--initial-pose "x,y,yaw"`: pose initiale AMCL (map), ex: `"0.0,0.0,0.0"`
 - `--goal-pose "x,y,yaw"`: goal `/navigate_to_pose`, ex: `"2.0,1.0,0.0"`
 
@@ -170,5 +175,26 @@ Note:
 
 - **Skill non autorisé**:
   - ajouter la compétence dans `script/bt_nodes_catalog.json` + implémenter sa traduction XML si nécessaire
+
+---
+
+### Validation post-génération (recommandé avant simulation)
+
+Le script de lancement exécute désormais une validation statique du BT avant Gazebo/Nav2.
+
+Validation manuelle:
+
+```bash
+python3 BT_Navigator/script/validate_bt_xml.py BT_Navigator/behavior_trees/__generated/turtlebot_mission.xml
+```
+
+Un exemple volontairement invalide est fourni pour déclencher des issues:
+- `BT_Navigator/behavior_trees/__generated/invalid_bt_for_validator_demo.xml`
+
+<!-- Pour dériver une allowlist depuis les BT Nav2 de référence:
+
+```bash
+python3 BT_Navigator/script/scan_reference_bts.py --output research/runs/reference_scan.json
+``` -->
 
 

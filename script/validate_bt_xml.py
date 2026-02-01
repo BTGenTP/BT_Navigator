@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# flake8: noqa
 """
 Static post-generation validator for Nav2 / BehaviorTree.CPP XML.
 
@@ -10,8 +11,7 @@ Checks (v1):
 - basic blackboard usage checks ({var} references)
 - basic control-flow structural checks (empty control nodes, suspicious repeat)
 
-This is research tooling; it aims to be strict-but-practical and produce a
-machine-readable report (JSON) for batch evaluation.
+
 """
 
 from __future__ import annotations
@@ -62,6 +62,55 @@ class Issue:
 
 def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _print_checklist(report: Dict[str, Any]) -> None:
+    """
+    Print a human-readable checklist to stderr.
+
+    This keeps stdout clean for JSON output when --output is '-'.
+    """
+    import sys
+
+    issues = report.get("issues") or []
+    if not isinstance(issues, list):
+        issues = []
+
+    def has(code: str, *, level: Optional[str] = None) -> bool:
+        for it in issues:
+            if not isinstance(it, dict):
+                continue
+            if it.get("code") != code:
+                continue
+            if level is None or it.get("level") == level:
+                return True
+        return False
+
+    def line(ok: bool, label: str) -> str:
+        return f"{'✅' if ok else '❌'} {label}"
+
+    checks = [
+        (not has("xml_parse", level="error"), "XML parse (well-formed)"),
+        (not has("root_tag", level="error"), "Root tag == <root>"),
+        (not has("root_main_tree", level="error"), "root@main_tree_to_execute present"),
+        (not has("missing_main_tree_def", level="error"), "MainTree definition exists"),
+        (not has("bt_missing_id", level="error"), "All <BehaviorTree> have ID"),
+        (not has("bt_duplicate_id", level="error"), "BehaviorTree IDs unique"),
+        (not has("subtree_missing_definition", level="error"), "All SubTree IDs defined"),
+        (not has("subtree_cycle", level="error"), "No SubTree cycles"),
+        (not has("tag_not_allowed", level="error"), "All tags allowed (catalog + refs)"),
+        (not has("missing_required_attr", level="error"), "Required attributes present"),
+        (not has("unknown_attr", level="error"), "No unknown attributes (strict mode)"),
+        (not has("empty_control_node", level="error"), "No empty control nodes"),
+        (
+            not has("blackboard_unproduced", level="error"),
+            "Blackboard vars consistent (strict mode)",
+        ),
+    ]
+
+    sys.stderr.write("\n[validate_bt_xml] Checklist\n")
+    for ok, label in checks:
+        sys.stderr.write(f"- {line(bool(ok), label)}\n")
 
 
 def _catalog_allowlist(catalog: Dict[str, Any]) -> Tuple[Set[str], Dict[str, Set[str]], Dict[str, Set[str]]]:
@@ -523,7 +572,8 @@ def _validate_tree(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Validate a Nav2 BehaviorTree.CPP XML file (static checks).")
-    p.add_argument("--xml", type=str, help="Path to the BT XML to validate.")
+    p.add_argument("xml", nargs="?", type=str, help="Path to the BT XML to validate.")
+    p.add_argument("--xml-path", type=str, default=None, help="Alternative to positional xml path.")
     p.add_argument(
         "--catalog",
         type=str,
@@ -560,7 +610,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    xml_path = Path(args.xml).resolve()
+    xml_arg = args.xml or args.xml_path
+    if not xml_arg:
+        raise SystemExit("Missing BT XML path. Provide positional <xml> or --xml-path <xml>.")
+    xml_path = Path(xml_arg).resolve()
     catalog_path = Path(args.catalog).resolve()
     reference_dir = None if args.no_reference_scan else Path(args.reference_dir).resolve()
 
@@ -572,6 +625,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         strict_blackboard=bool(args.strict_blackboard),
     )
 
+    _print_checklist(report)
+
     out_text = json.dumps(report, indent=2, ensure_ascii=False)
     if args.output == "-":
         print(out_text)
@@ -580,7 +635,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(out_text + "\n", encoding="utf-8")
         print(f"Wrote: {out_path}")
-    return 0 if report.get("ok") else 1
+
+    if report.get("ok"):
+        print("BT XML is valid ! ✅")
+        return 0
+    else:
+        print("BT XML is invalid ❌.")
+        return 1
 
 
 if __name__ == "__main__":

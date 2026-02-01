@@ -8,6 +8,8 @@ AUTO_MODE=0
 PROMPT=""
 NO_RVIZ=0
 SEND_GOAL=0
+VALIDATE_BT=1
+STRICT_VALIDATE_ATTRS=0
 INITIAL_POSE="0.0,0.0,0.0" # x,y,yaw(rad) in map
 GOAL_POSE="0.0,0.0,0.0"    # x,y,yaw(rad) in map
 
@@ -16,6 +18,9 @@ while [ "$#" -gt 0 ]; do
     --auto) AUTO_MODE=1; shift ;;
     --no-rviz) NO_RVIZ=1; shift ;;
     --send-goal) SEND_GOAL=1; shift ;;
+    --validate-bt) VALIDATE_BT=1; shift ;;
+    --no-validate-bt) VALIDATE_BT=0; shift ;;
+    --strict-validate-attrs) STRICT_VALIDATE_ATTRS=1; shift ;;
     --initial-pose) INITIAL_POSE="${2:-}"; shift 2 ;;
     --goal-pose) GOAL_POSE="${2:-}"; shift 2 ;;
     *) PROMPT="$*"; break ;;
@@ -118,6 +123,22 @@ echo "------------------------------------------------------------"
 cat "$GENERATED_BT_XML"
 echo
 echo "------------------------------------------------------------"
+
+if [ "$VALIDATE_BT" -eq 1 ]; then
+  VALIDATION_REPORT="/tmp/validate_bt_report.json"
+  log "Validation statique du BT (pré-simulation) → $VALIDATION_REPORT"
+  VALIDATE_ARGS=(--output "$VALIDATION_REPORT")
+  if [ "$STRICT_VALIDATE_ATTRS" -eq 1 ]; then
+    VALIDATE_ARGS+=(--strict-attrs)
+  fi
+  if ! python3 "$SCRIPT_DIR/validate_bt_xml.py" "$GENERATED_BT_XML" "${VALIDATE_ARGS[@]}"; then
+    err "BT invalide: simulation annulée. Voir: $VALIDATION_REPORT"
+    exit 1
+  fi
+  log "BT validé ✔️"
+else
+  log "--no-validate-bt: validation ignorée."
+fi
 
 if [ "$AUTO_MODE" -eq 0 ]; then
   while true; do

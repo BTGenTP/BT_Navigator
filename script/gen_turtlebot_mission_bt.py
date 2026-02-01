@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# flake8: noqa
 
 """
 Générateur de Behavior Tree pour le projet BT_Navigator.
@@ -33,7 +34,11 @@ from xml.etree.ElementTree import Comment, Element, ElementTree, SubElement
 
 import datetime
 
-from prompt_guardrails import SafetyReport, analyze_prompt_heuristic, call_moderation_llm
+from prompt_guardrails import (  # type: ignore
+    SafetyReport,
+    analyze_prompt_heuristic,
+    call_moderation_llm,
+)
 
 try:  # Support d'un fichier .env facultatif
     from dotenv import load_dotenv  # type: ignore
@@ -345,6 +350,7 @@ def call_llm_for_steps(
     model: str,
     api_base: str,
     catalog: Dict[str, Any],
+    extra_user_context: Optional[str] = None,
 ) -> List[MissionStep]:
     try:
         from openai import OpenAI  # type: ignore
@@ -372,7 +378,7 @@ def call_llm_for_steps(
         "Catalogue (résumé des skills):\n"
         + "\n".join(
             [
-                f"- {sid}: {allowed[sid].get('semantic_description','')}"
+                f"- {sid}: {allowed[sid].get('semantic_description', '')}"
                 for sid in allowed_list
             ]
         )
@@ -385,6 +391,9 @@ def call_llm_for_steps(
     )
 
     client = OpenAI(api_key=api_key, base_url=api_base)
+    extra = ""
+    if extra_user_context:
+        extra = "\n\n" + str(extra_user_context).strip()
     completion = client.chat.completions.create(
         model=model,
         temperature=0.2,
@@ -396,6 +405,7 @@ def call_llm_for_steps(
                     "Objectif de mission (langage naturel):\n"
                     f"{natural_language_prompt}\n\n"
                     "Renvoie UNIQUEMENT le JSON d'étapes."
+                    f"{extra}"
                 ),
             },
         ],
@@ -494,10 +504,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
     if args.prompt:
-        prompt = args.prompt.strip()
+        raw_prompt = args.prompt.strip()
     else:
-        prompt = sys.stdin.read().strip()
-    if not prompt:
+        raw_prompt = sys.stdin.read().strip()
+    if not raw_prompt:
         print("Erreur: aucun prompt fourni (--prompt ou stdin).", file=sys.stderr)
         return 1
 
@@ -510,24 +520,230 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     catalog = _load_catalog(CATALOG_PATH)
+    allowed_skills = sorted(_allowed_skills(catalog).keys())
 
-    try:
-        steps = call_llm_for_steps(
-            natural_language_prompt=prompt,
-            api_key=api_key,
-            model=args.model,
-            api_base=args.api_base,
-            catalog=catalog,
+    prompt = _normalize_prompt(raw_prompt)
+
+    # Pré-traitement mode auto-rewrite (optionnel, surtout utile si prompt long/bruité)
+    if args.mode == "auto-rewrite" and (len(prompt) > int(args.max_prompt_chars) or "\n" in raw_prompt):
+        prompt = _auto_rewrite_prompt(prompt, allowed_skills=allowed_skills, max_chars=int(args.max_prompt_chars))
+
+    blocked_attempts = 0
+    clarify_rounds = 0
+
+    def enforce_budget(p: str) -> str:
+        max_chars = int(args.max_prompt_chars)
+        if len(p) <= max_chars:
+            return p
+        if args.mode == "fail-fast":
+            raise RuntimeError(
+                f"Prompt trop long: {len(p)} caractères (max {max_chars}). "
+                "Réduisez le prompt ou utilisez --mode interactive/auto-rewrite."
+            )
+        if args.mode == "auto-rewrite":
+            return _auto_rewrite_prompt(p, allowed_skills=allowed_skills, max_chars=max_chars)
+        # interactive
+        if not _is_interactive_stdin():
+            raise RuntimeError(
+                f"Prompt trop long: {len(p)} caractères (max {max_chars}) et stdin non-interactif. "
+                "Utilisez --mode fail-fast ou --mode auto-rewrite."
+            )
+        short = _ask(
+            f"Le prompt fait {len(p)} caractères (max {max_chars}). "
+            "Donne une version plus courte (mission + chiffres/unités), puis Entrée:\n> "
         )
-    except Exception as exc:
-        print(f"Erreur appel LLM: {exc}", file=sys.stderr)
-        return 1
+        return _normalize_prompt(short)
+
+    def guardrails_gate(p: str) -> str:
+        nonlocal blocked_attempts, clarify_rounds
+        moderation_api_key = args.moderation_api_key or os.getenv("LLM_MODERATION_API_KEY")
+        rep = _apply_guardrails(
+            text=p,
+            guardrails_mode=str(args.guardrails),
+            moderation_api_key=moderation_api_key,
+            moderation_api_base=str(args.moderation_api_base or ""),
+            moderation_model=str(args.moderation_model or ""),
+        )
+        if not rep.blocked:
+            # Option: si secrets détectés, utiliser une version redacted pour éviter fuite.
+            if rep.redacted_text and args.mode in ("auto-rewrite", "interactive"):
+                p = rep.redacted_text
+            return p
+
+        blocked_attempts += 1
+        if blocked_attempts >= 3:
+            raise RuntimeError(
+                f"Guardrails: prompts bloqués à répétition ({blocked_attempts}). "
+                f"Raison(s): {rep.summary()}"
+            )
+
+        if args.mode == "fail-fast":
+            raise RuntimeError(f"Guardrails: prompt bloqué. Raison(s): {rep.summary()}")
+        if args.mode == "auto-rewrite":
+            raise RuntimeError(
+                "Guardrails: prompt bloqué en mode auto-rewrite. "
+                f"Raison(s): {rep.summary()}"
+            )
+
+        # interactive
+        if not _is_interactive_stdin():
+            raise RuntimeError(
+                f"Guardrails: prompt bloqué ({rep.summary()}) et stdin non-interactif. "
+                "Utilisez --mode fail-fast ou fournissez un prompt non sensible."
+            )
+
+        hint = (
+            "Le prompt semble contenir des éléments sensibles/malveillants (ex: injection, secrets, haine/violence).\n"
+            f"Détails: {rep.summary()}\n"
+            "Colle une version nettoyée (mission robot uniquement, sans secrets/attaques), puis Entrée:\n> "
+        )
+        cleaned = _ask(hint)
+        clarify_rounds += 1
+        return _normalize_prompt(cleaned)
+
+    # Boucle de clarification pré-LLM (budget + guardrails)
+    while True:
+        prompt = enforce_budget(prompt)
+        prompt = guardrails_gate(prompt)
+        prompt = enforce_budget(prompt)
+        break
+
+    def maybe_clarify_ambiguities(p: str) -> str:
+        nonlocal clarify_rounds
+        if args.mode != "interactive":
+            return p
+        if clarify_rounds >= int(args.max_clarify_rounds):
+            return p
+        if not _is_interactive_stdin():
+            return p
+
+        # Heuristiques simples d'ambiguïté: action sans valeur numérique.
+        import re
+
+        questions: List[str] = []
+        if re.search(r"\b(attends?|wait)\b", p, re.I) and not re.search(r"\b(attends?|wait)\b\s*\d", p, re.I):
+            questions.append("Quelle durée pour Wait (secondes) ? ex: 2.0")
+        if re.search(r"\b(tourne|spin)\b", p, re.I) and not re.search(r"\b(tourne|spin)\b[^\d]{0,8}\d", p, re.I):
+            questions.append("Quel angle pour Spin (radians) ? ex: 1.57 pour ~90°")
+        if re.search(r"\b(recule|backup)\b", p, re.I) and not re.search(r"\b(recule|backup)\b[^\d]{0,8}\d", p, re.I):
+            questions.append("Quelle distance/vitesse pour BackUp ? ex: 0.30m à 0.05m/s")
+        if re.search(r"\b(avance|drive)\b", p, re.I) and not re.search(r"\b(avance|drive)\b[^\d]{0,8}\d", p, re.I):
+            questions.append("Quelle distance/vitesse/temps pour DriveOnHeading ? ex: 2.0m à 0.2m/s (12s)")
+
+        if not questions:
+            return p
+
+        answers: List[str] = []
+        for q in questions:
+            ans = _ask(f"[Clarification] {q}\n> ").strip()
+            if ans:
+                answers.append(ans)
+        if not answers:
+            return p
+
+        clarify_rounds += 1
+        enriched = p + "\n\nClarifications (valeurs explicites):\n- " + "\n- ".join(answers)
+        return enriched
+
+    prompt = maybe_clarify_ambiguities(prompt)
+    prompt = enforce_budget(prompt)
+
+    # Appel LLM + réparations contrôlées
+    extra_ctx: Optional[str] = None
+    retries_left = 2
+    while True:
+        try:
+            steps = call_llm_for_steps(
+                natural_language_prompt=prompt,
+                api_key=api_key,
+                model=args.model,
+                api_base=args.api_base,
+                catalog=catalog,
+                extra_user_context=extra_ctx,
+            )
+            break
+        except Exception as exc:
+            if retries_left <= 0:
+                print(f"Erreur appel LLM: {exc}", file=sys.stderr)
+                return 1
+            retries_left -= 1
+
+            missing = _extract_missing_port(exc)
+            if missing and args.mode == "interactive" and _is_interactive_stdin():
+                val = _ask(
+                    f"[Repair] Port requis manquant pour skill '{missing['skill']}': {missing['port']}\n"
+                    "Donne une valeur (nombre/texte) à utiliser, puis Entrée:\n> "
+                ).strip()
+                extra_ctx = (
+                    "Réparation: ton JSON précédent manquait un port requis.\n"
+                    f"Pour l'étape skill='{missing['skill']}', ajoute params['{missing['port']}']={val}.\n"
+                    "Renvoie UNIQUEMENT le JSON complet corrigé."
+                )
+                continue
+
+            if "Réponse LLM non JSON" in str(exc):
+                extra_ctx = (
+                    "Réparation: ta réponse précédente n'était pas un JSON valide.\n"
+                    "Renvoie UNIQUEMENT un JSON valide: une liste d'objets "
+                    "{\"skill\":...,\"params\":...,\"comment\":...}.\n"
+                    "Aucun texte, aucune balise, aucun markdown."
+                )
+                continue
+
+            # fallback: en interactif, demander une reformulation concise
+            if args.mode == "interactive" and _is_interactive_stdin() and clarify_rounds < int(args.max_clarify_rounds):
+                clarify_rounds += 1
+                prompt = _normalize_prompt(
+                    _ask(
+                        f"[Clarification] Échec de génération ({exc}).\n"
+                        "Reformule la mission en 1-2 phrases avec chiffres/unités (<= 2000 chars), puis Entrée:\n> "
+                    )
+                )
+                prompt = enforce_budget(prompt)
+                extra_ctx = None
+                continue
+
+            print(f"Erreur appel LLM: {exc}", file=sys.stderr)
+            return 1
 
     try:
         xml_tree = build_bt_xml(steps, catalog=catalog)
     except Exception as exc:
         print(f"Erreur génération XML: {exc}", file=sys.stderr)
         return 1
+
+    # Option: validation statique du XML avant écriture
+    if args.validate_xml:
+        try:
+            import tempfile
+            import validate_bt_xml as v  # type: ignore
+
+            with tempfile.NamedTemporaryFile("wb", suffix=".xml", delete=False) as tmp:
+                xml_tree.write(tmp, encoding="utf-8", xml_declaration=False)
+                tmp_path = Path(tmp.name)
+
+            reference_dir = (SCRIPT_DIR.parent / "behavior_trees").resolve()
+            report = v._validate_tree(
+                xml_path=tmp_path,
+                reference_dir=reference_dir if reference_dir.exists() else None,
+                catalog_path=CATALOG_PATH,
+                strict_attrs=bool(args.strict_validate_attrs),
+                strict_blackboard=bool(args.strict_validate_blackboard),
+            )
+            try:
+                tmp_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
+            if not report.get("ok"):
+                issues = report.get("issues") or []
+                print("Erreur: BT XML invalide (validation statique).", file=sys.stderr)
+                for it in issues[:25]:
+                    if isinstance(it, dict):
+                        print(f"- {it.get('level')} {it.get('code')}: {it.get('message')}", file=sys.stderr)
+                return 1
+        except Exception as exc:
+            print(f"Erreur validation XML: {exc}", file=sys.stderr)
+            return 1
 
     ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     header = (
@@ -559,5 +775,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-
-

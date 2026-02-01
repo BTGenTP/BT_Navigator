@@ -22,11 +22,11 @@ _INJECTION_PATTERNS: Sequence[re.Pattern[str]] = [
     re.compile(r"\b(jailbreak|prompt\s*inject)\b", re.I),
 ]
 
-_HATE_VIOLENCE_PATTERNS: Sequence[re.Pattern[str]] = [
-    # Minimal / conservateur: vous pouvez enrichir selon votre contexte.
-    re.compile(r"\b(kill|murder|massacre|suicide)\b", re.I),
-    re.compile(r"\b(hate|racis(t|me)|nazi)\b", re.I),
-]
+# _HATE_VIOLENCE_PATTERNS: Sequence[re.Pattern[str]] = [
+#     # Minimal / conservateur: vous pouvez enrichir selon votre contexte.
+#     re.compile(r"\b(kill|murder|massacre|suicide)\b", re.I),
+#     re.compile(r"\b(hate|racis(t|me)|nazi)\b", re.I),
+# ]
 
 _SECRET_PATTERNS: Sequence[Tuple[str, re.Pattern[str]]] = [
     ("private_key", re.compile(r"-----BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY-----", re.I)),
@@ -87,16 +87,16 @@ def analyze_prompt_heuristic(text: str) -> SafetyReport:
             )
             break
 
-    for pat in _HATE_VIOLENCE_PATTERNS:
-        if pat.search(text):
-            findings.append(
-                Finding(
-                    kind="hate_violence",
-                    code="content_policy",
-                    message="Contenu potentiellement violent/haineux détecté.",
-                )
-            )
-            break
+    # for pat in _HATE_VIOLENCE_PATTERNS:
+    #     if pat.search(text):
+    #         findings.append(
+    #             Finding(
+    #                 kind="hate_violence",
+    #                 code="content_policy",
+    #                 message="Contenu potentiellement violent/haineux détecté.",
+    #             )
+    #         )
+    #         break
 
     redacted, secret_findings = _redact_secrets(text)
     findings.extend(secret_findings)

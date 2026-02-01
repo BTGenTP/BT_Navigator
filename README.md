@@ -88,6 +88,13 @@ Options utiles:
 - `--output <path>`: choisir le chemin de sortie
 - `--dry-run`: affiche sur stdout sans écrire de fichier
 - `--model`, `--api-base`, `--api-key`: override des paramètres LLM
+- `--mode {interactive,fail-fast,auto-rewrite}`: gestion prompts longs/ambigus (défaut: `interactive`)
+- `--max-prompt-chars 2000`: budget de taille du prompt avant appel LLM
+- `--max-clarify-rounds 3`: nombre max de boucles de clarification (mode interactif)
+- `--guardrails {off,heuristic,hybrid}`: guardrails sécurité (défaut: `hybrid`)
+- `--moderation-api-key`, `--moderation-api-base`, `--moderation-model`: modération optionnelle (OpenAI-compatible)
+- `--validate-xml`: valide le BT XML généré via `validate_bt_xml.py` avant écriture
+- `--strict-validate-attrs`, `--strict-validate-blackboard`: options strictes de validation
 
 ---
 
@@ -171,6 +178,11 @@ Note:
 
 - **Erreur “Réponse LLM non JSON”**:
   - le LLM n’a pas respecté la contrainte; réduire la complexité du prompt et relancer
+  - ou utiliser `--mode interactive` (défaut) qui proposera des clarifications / réparations contrôlées
+
+- **Erreur “Guardrails: prompt bloqué”**:
+  - le prompt contient des éléments détectés comme sensibles/malveillants (injection, secrets/PII, haine/violence)
+  - en interactif, fournissez une version “mission robot uniquement” sans données confidentielles
 
 - **Skill non autorisé**:
   - ajouter la compétence dans `script/bt_nodes_catalog.json` + implémenter sa traduction XML si nécessaire
